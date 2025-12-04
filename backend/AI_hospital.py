@@ -30,6 +30,7 @@ class AgentState(TypedDict):
     agent_order: list[str]
     current_report: list[str]
     current_agent: str
+    consultation_id: Optional[int]
 patient_info = ""
 final_report = ""
 
