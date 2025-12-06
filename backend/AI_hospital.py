@@ -1,5 +1,5 @@
 import os, sys
-from typing import TypedDict, Annotated, List, Literal
+from typing import TypedDict, Annotated, List, Literal, Optional
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
@@ -13,6 +13,9 @@ from typing import Annotated, Sequence, TypedDict, List
 from langchain_core.prompts import PromptTemplate
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import InjectedState # <--- CRITICAL: Allows tools to see patient_id
+from .database import SessionLocal # <--- Database Connection
+from . import models # <--- Database Tables
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from Knowledge_notebooks.initialize_rag import VectorRAG_initialize
@@ -31,6 +34,7 @@ class AgentState(TypedDict):
     current_report: list[str]
     current_agent: str
     consultation_id: Optional[int]
+    patient_id: Optional[int]
 patient_info = ""
 final_report = ""
 
@@ -112,33 +116,114 @@ def search_internet(query: str) -> str:
         return f"Search failed: {str(e)}"
 
 
+# @tool
+# def add_report(report: str) -> str:
+#     """Add a report to the current patient's record.
+
+#     Args:
+#         report (str): The report content to add.
+
+#     Returns:
+#         str: Confirmation message.
+#     """
+#     return "Report added to patient's record."
+
 @tool
-def add_report(report: str) -> str:
-    """Add a report to the current patient's record.
-
-    Args:
-        report (str): The report content to add.
-
-    Returns:
-        str: Confirmation message.
+def add_report(report: str, state: Annotated[dict, InjectedState]) -> str:
     """
-    return "Report added to patient's record."
+    Add a report. Automatically attaches to the currently ACTIVE consultation.
+    """
+    
+    # 1. Get Patient ID
+    current_patient_id = state.get("patient_id")
+    if not current_patient_id:
+        return "Error: No Patient ID linked."
 
+    is_final = "Final Report" in report or "Diagnosis" in report
+
+    try:
+        with SessionLocal() as db:
+            # 2. CRITICAL: Find the 'Active' consultation for THIS patient
+            # This replaces the need to store ID in state.
+            consult = db.query(models.Consultation).filter(
+                models.Consultation.patient_id == current_patient_id,
+                models.Consultation.status == 'Active'
+            ).order_by(models.Consultation.consultation_id.desc()).first()
+            
+            if not consult:
+                return "Error: No Active Consultation found. Please triage patient first."
+
+            if is_final:
+                # Close the session
+                db_report = models.MedicalReport(
+                    consultation_id=consult.consultation_id,
+                    diagnosis=report,
+                    treatment="See details"
+                )
+                db.add(db_report)
+                consult.status = "Completed" # <--- Closes the loop
+                db.commit()
+                print(f"✅ DB: Saved FINAL REPORT for Consult #{consult.consultation_id}")
+                
+            else:
+                # Helper Result
+                new_order = models.LabOrder(
+                    consultation_id=consult.consultation_id,
+                    test_name="Helper Finding",
+                    status="Completed"
+                )
+                db.add(new_order)
+                db.commit()
+                
+                new_result = models.LabResult(
+                    order_id=new_order.order_id,
+                    findings=report
+                )
+                db.add(new_result)
+                db.commit()
+                print(f"✅ DB: Saved LAB RESULT for Consult #{consult.consultation_id}")
+
+            return "Report added to patient's record."
+
+    except Exception as e:
+        return f"Database Error: {str(e)}"
 @tool
-def Patient_data_report(data: str)->str:
+def Patient_data_report(data: str, state: Annotated[dict, InjectedState]) -> str:
     """
-    Process and store patient data for specialist recommendation.
-    
-    Args:
-        data (str): Raw patient data including symptoms, history, and test results.
-    
-    Returns:
-        str: Status message indicating data compiled and specialist recommendation needed.
+    Process patient data. Creates a new 'Active' Consultation in the database.
     """
     global patient_info
     patient_info = data
-    return "Patient Data compiled, Recommend a Specialist"
+    
+    # 1. Get Patient ID (Passed from API -> State)
+    current_patient_id = state.get("patient_id")
+    if not current_patient_id:
+        return "Error: Patient ID not found."
 
+    try:
+        with SessionLocal() as db:
+            # 2. Safety Check: Close any old "stuck" active sessions for this patient?
+            # (Optional, but good practice)
+            existing = db.query(models.Consultation).filter(
+                models.Consultation.patient_id == current_patient_id,
+                models.Consultation.status == "Active"
+            ).first()
+            if existing:
+                existing.status = "Abandoned" # or reuse it
+            
+            # 3. Create NEW Consultation
+            new_consult = models.Consultation(
+                patient_id=current_patient_id,
+                status="Active"
+            )
+            db.add(new_consult)
+            db.commit()
+            db.refresh(new_consult)
+            
+            return f"Patient Data compiled. Consultation #{new_consult.consultation_id} Started."
+            
+    except Exception as e:
+        return f"Error saving to DB: {str(e)}"
 @tool
 def VectorRAG_Retrival(query:str, agent:str)->str:
     """Retrieve and synthesize information from a domain-specific vector store.

@@ -36,6 +36,7 @@ type ToolEventData = {
 }
 
 const BACKEND = import.meta.env.VITE_API_BASE || '' // use proxy when ''
+const LOGIN_URL = 'http://localhost:8000/login'
 
 export default function App() {
   const [threadId, setThreadId] = useState<string | null>(null)
@@ -43,6 +44,11 @@ export default function App() {
   const [pendingAsk, setPendingAsk] = useState<AskEvent | null>(null)
   const [currentAgent, setCurrentAgent] = useState<string>('GP')
   const [tools, setTools] = useState<ToolEventData[]>([])
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem('token'))
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [authLoading, setAuthLoading] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const chatRef = useRef<HTMLDivElement>(null)
@@ -78,8 +84,50 @@ export default function App() {
     }
   }, [])
 
+  const handleLogin = useCallback(async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    if (!email.trim() || !password.trim()) {
+      setAuthError('Email and password are required.')
+      return
+    }
+    setAuthLoading(true)
+    setAuthError(null)
+    try {
+      const response = await fetch(LOGIN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ username: email.trim(), password: password.trim() }).toString()
+      })
+      if (!response.ok) {
+        throw new Error('Invalid credentials')
+      }
+      const data = await response.json()
+      if (!data?.access_token) {
+        throw new Error('Login response missing access_token')
+      }
+      localStorage.setItem('token', data.access_token)
+      setToken(data.access_token)
+      setEmail('')
+      setPassword('')
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Login failed')
+    } finally {
+      setAuthLoading(false)
+    }
+  }, [email, password])
+
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem('token')
+    setToken(null)
+  }, [])
+
   const startStream = useCallback((userText: string) => {
-    const url = `${BACKEND}/api/graph/start/stream?message=${encodeURIComponent(userText)}`
+    const activeToken = token || localStorage.getItem('token')
+    if (!activeToken) {
+      setAuthError('Please log in to start a consultation.')
+      return
+    }
+    const url = `${BACKEND}/api/graph/start/stream?message=${encodeURIComponent(userText)}&token=${encodeURIComponent(activeToken)}`
     const es = new EventSource(url)
 
     es.addEventListener('thread', (e) => {
@@ -128,10 +176,15 @@ export default function App() {
     es.onerror = () => {
       es.close()
     }
-  }, [])
+  }, [token])
 
   const resumeStream = useCallback((tid: string, reply: string) => {
-    const url = `${BACKEND}/api/graph/resume/stream?thread_id=${encodeURIComponent(tid)}&user_reply=${encodeURIComponent(reply)}`
+    const activeToken = token || localStorage.getItem('token')
+    if (!activeToken) {
+      setAuthError('Session expired. Please log in again.')
+      return
+    }
+    const url = `${BACKEND}/api/graph/resume/stream?thread_id=${encodeURIComponent(tid)}&user_reply=${encodeURIComponent(reply)}&token=${encodeURIComponent(activeToken)}`
     const es = new EventSource(url)
   setPendingAsk(null)
   setChat((c) => [...c, { role: 'user', content: reply }])
@@ -176,12 +229,16 @@ export default function App() {
     es.onerror = () => {
       es.close()
     }
-  }, [])
+  }, [token])
 
   const onSubmit = useCallback((e: FormEvent) => {
     e.preventDefault()
     const val = inputRef.current?.value?.trim()
     if (!val) return
+    if (!(token || localStorage.getItem('token'))) {
+      setAuthError('Please log in before chatting.')
+      return
+    }
     if (!threadId) {
       setChat((prev: ChatItem[]) => [...prev, { role: 'user', content: val }])
       startStream(val)
@@ -189,7 +246,7 @@ export default function App() {
       resumeStream(threadId, val)
     }
     if (inputRef.current) inputRef.current.value = ''
-  }, [threadId, pendingAsk, startStream, resumeStream])
+  }, [threadId, pendingAsk, startStream, resumeStream, token])
 
   // Auto-scroll chat & tools
   useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight }, [chat])
@@ -211,6 +268,34 @@ export default function App() {
           </div>
           <div className="badge">Live</div>
         </header>
+        <section className="auth-panel glass-inner">
+          {!token ? (
+            <form className="auth-form" onSubmit={handleLogin}>
+              <h2>Patient Login</h2>
+              <input
+                type="email"
+                value={email}
+                placeholder="Email"
+                onChange={(e) => setEmail(e.target.value)}
+              />
+              <input
+                type="password"
+                value={password}
+                placeholder="Password"
+                onChange={(e) => setPassword(e.target.value)}
+              />
+              <button className="btn" type="submit" disabled={authLoading}>
+                {authLoading ? 'Signing in…' : 'Login'}
+              </button>
+            </form>
+          ) : (
+            <div className="auth-status">
+              <span>Logged in</span>
+              <button className="btn" type="button" onClick={handleLogout}>Logout</button>
+            </div>
+          )}
+          {authError && <p className="auth-error">{authError}</p>}
+        </section>
         <div className="main-row">
           <main className="chat glass-inner" ref={chatRef}>
             {chat.map((m: ChatItem, i: number) => (
